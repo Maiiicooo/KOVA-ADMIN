@@ -226,6 +226,9 @@
 
         <button type="submit" id="saveBtn">Save to pending spots</button>
 
+        <button type="button" id="syncBtn">Sync locally saved spots</button>
+        <div id="queueStatus" class="small">Locally saved spots: 0</div>
+
         <div id="status" class="status"></div>
       </form>
     </main>
@@ -253,6 +256,8 @@
       const form = document.getElementById("spotForm");
       const gpsBtn = document.getElementById("gpsBtn");
       const saveBtn = document.getElementById("saveBtn");
+      const syncBtn = document.getElementById("syncBtn");
+      const queueStatusEl = document.getElementById("queueStatus");
       const statusEl = document.getElementById("status");
 
       const latInput = document.getElementById("lat");
@@ -279,6 +284,106 @@
           .toLowerCase()
           .replace(/[^a-z0-9._-]/g, "-")
           .slice(0, 80);
+      }
+
+      const LOCAL_DB_NAME = "kova-offline-spots";
+      const LOCAL_DB_VERSION = 1;
+      const LOCAL_STORE_NAME = "pendingSpotQueue";
+      const UPLOAD_TIMEOUT_MS = 12000;
+
+      function openLocalDb() {
+        return new Promise((resolve, reject) => {
+          const request = indexedDB.open(LOCAL_DB_NAME, LOCAL_DB_VERSION);
+
+          request.onupgradeneeded = () => {
+            const localDb = request.result;
+
+            if (!localDb.objectStoreNames.contains(LOCAL_STORE_NAME)) {
+              localDb.createObjectStore(LOCAL_STORE_NAME, { keyPath: "id" });
+            }
+          };
+
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      async function withLocalStore(mode, callback) {
+        const localDb = await openLocalDb();
+
+        return new Promise((resolve, reject) => {
+          const tx = localDb.transaction(LOCAL_STORE_NAME, mode);
+          const store = tx.objectStore(LOCAL_STORE_NAME);
+          const result = callback(store);
+
+          tx.oncomplete = () => {
+            localDb.close();
+            resolve(result);
+          };
+
+          tx.onerror = () => {
+            localDb.close();
+            reject(tx.error);
+          };
+        });
+      }
+
+      function requestToPromise(request) {
+        return new Promise((resolve, reject) => {
+          request.onsuccess = () => resolve(request.result);
+          request.onerror = () => reject(request.error);
+        });
+      }
+
+      async function getQueuedSpots() {
+        const localDb = await openLocalDb();
+
+        return new Promise((resolve, reject) => {
+          const tx = localDb.transaction(LOCAL_STORE_NAME, "readonly");
+          const store = tx.objectStore(LOCAL_STORE_NAME);
+          const request = store.getAll();
+
+          request.onsuccess = () => resolve(request.result || []);
+          request.onerror = () => reject(request.error);
+
+          tx.oncomplete = () => localDb.close();
+          tx.onerror = () => {
+            localDb.close();
+            reject(tx.error);
+          };
+        });
+      }
+
+      async function saveSpotLocally(spot) {
+        await withLocalStore("readwrite", (store) => store.put(spot));
+        await updateQueueStatus();
+      }
+
+      async function deleteLocalSpot(id) {
+        await withLocalStore("readwrite", (store) => store.delete(id));
+        await updateQueueStatus();
+      }
+
+      async function updateQueueStatus() {
+        try {
+          const queued = await getQueuedSpots();
+          const count = queued.length;
+          queueStatusEl.textContent = `Locally saved spots: ${count}${navigator.onLine ? "" : " · offline"}`;
+          syncBtn.disabled = count === 0;
+        } catch (err) {
+          console.error(err);
+          queueStatusEl.textContent = "Could not read local queue.";
+        }
+      }
+
+      function withTimeout(promise, ms, message = "Upload took too long") {
+        let timer;
+
+        const timeout = new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error(message)), ms);
+        });
+
+        return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
       }
 
       function encodeGeohash(latitude, longitude, precision = 9) {
@@ -416,6 +521,86 @@
         return await snapshot.ref.getDownloadURL();
       }
 
+      async function uploadQueuedSpot(spot) {
+        const docRef = db.collection("pending_spots").doc(spot.id);
+        const photoURL = await uploadPhoto(spot.file, spot.id);
+
+        await docRef.set({
+          name: spot.name,
+          description: spot.description,
+          photoURL,
+          addedBy: spot.addedBy,
+          lat: spot.lat,
+          lng: spot.lng,
+          geohash: spot.geohash,
+
+          status: "pending",
+
+          ratingSum: 0,
+          ratingCount: 0,
+          avgRating: 0,
+
+          createdOffline: Boolean(spot.createdOffline),
+          localCreatedAt: spot.localCreatedAt || null,
+          syncedAt: firebase.firestore.FieldValue.serverTimestamp(),
+          timestamp: firebase.firestore.FieldValue.serverTimestamp(),
+        });
+      }
+
+      async function syncQueuedSpots() {
+        if (!navigator.onLine) {
+          status("No internet. Spots stay locally saved.", "bad");
+          await updateQueueStatus();
+          return;
+        }
+
+        const queued = await getQueuedSpots();
+
+        if (!queued.length) {
+          status("No locally saved spots to sync.", "good");
+          await updateQueueStatus();
+          return;
+        }
+
+        syncBtn.disabled = true;
+        status(`Syncing ${queued.length} locally saved spot(s)...`);
+
+        let synced = 0;
+        let failed = 0;
+
+        for (const spot of queued) {
+          try {
+            await withTimeout(
+              uploadQueuedSpot(spot),
+              UPLOAD_TIMEOUT_MS,
+              "Sync took too long. Will retry later.",
+            );
+
+            await deleteLocalSpot(spot.id);
+            synced += 1;
+          } catch (err) {
+            console.error(err);
+            failed += 1;
+          }
+        }
+
+        await updateQueueStatus();
+
+        if (failed === 0) {
+          status(`Synced ${synced} spot(s) to pending_spots.`, "good");
+        } else {
+          status(`Synced ${synced}. ${failed} still locally saved for retry.`, "bad");
+        }
+      }
+
+      function resetFormAfterSave() {
+        nameInput.value = "";
+        descriptionInput.value = "";
+        photoFileInput.value = "";
+        photoPreview.style.display = "none";
+        photoPreview.removeAttribute("src");
+      }
+
       gpsBtn.addEventListener("click", () => {
         if (!navigator.geolocation) {
           status("GPS not supported on this device.", "bad");
@@ -501,49 +686,59 @@
         saveBtn.disabled = true;
         status("Preparing pending spot...");
 
+        const localSpot = {
+          id: db.collection("pending_spots").doc().id,
+          name,
+          description,
+          addedBy,
+          lat,
+          lng,
+          geohash: encodeGeohash(lat, lng, 9),
+          file,
+          fileName: file.name || "spot.jpg",
+          fileType: file.type || "image/jpeg",
+          createdOffline: true,
+          localCreatedAt: new Date().toISOString(),
+        };
+
+        // First save locally. This prevents losing the spot if internet dies during upload.
+        await saveSpotLocally(localSpot);
+
         try {
-          const docRef = db.collection("pending_spots").doc();
-          const geohash = encodeGeohash(lat, lng, 9);
+          if (!navigator.onLine) {
+            throw new Error("Offline");
+          }
 
-          status("Uploading photo...");
-          const photoURL = await uploadPhoto(file, docRef.id);
+          status("Uploading spot...");
 
-          status("Saving to pending spots...");
+          await withTimeout(
+            uploadQueuedSpot(localSpot),
+            UPLOAD_TIMEOUT_MS,
+            "Upload took too long. Saved locally instead.",
+          );
 
-          await docRef.set({
-            name,
-            description,
-            photoURL,
-            addedBy,
-            lat,
-            lng,
-            geohash,
-
-            status: "pending",
-
-            ratingSum: 0,
-            ratingCount: 0,
-            avgRating: 0,
-
-            timestamp: firebase.firestore.FieldValue.serverTimestamp(),
-          });
-
-          status("Spot saved to pending_spots. Not live yet.");
-
-          nameInput.value = "";
-          descriptionInput.value = "";
-          photoFileInput.value = "";
-          photoPreview.style.display = "none";
-          photoPreview.removeAttribute("src");
+          await deleteLocalSpot(localSpot.id);
+          status("Spot uploaded to pending_spots. Not live yet.", "good");
+          resetFormAfterSave();
         } catch (err) {
           console.error(err);
-          status(err.message || "Could not save pending spot.", "bad");
+          status("Internet weak/offline. Spot saved locally and will auto-upload later.", "good");
+          resetFormAfterSave();
         } finally {
           saveBtn.disabled = false;
+          await updateQueueStatus();
         }
       });
 
+      syncBtn.addEventListener("click", syncQueuedSpots);
+
+      window.addEventListener("online", syncQueuedSpots);
+      window.addEventListener("offline", updateQueueStatus);
+
       initMiniMap();
+      updateQueueStatus();
+      setTimeout(syncQueuedSpots, 1500);
+      setInterval(syncQueuedSpots, 30000);
     </script>
   </body>
 </html>
