@@ -279,6 +279,11 @@
         if (type === "bad") statusEl.classList.add("bad");
       }
 
+      function getErrorText(err) {
+        if (!err) return "Unknown error";
+        return err.code ? `${err.code}: ${err.message || ""}` : err.message || String(err);
+      }
+
       function makeSafeFileName(name) {
         return String(name || "spot.jpg")
           .toLowerCase()
@@ -289,7 +294,7 @@
       const LOCAL_DB_NAME = "kova-offline-spots";
       const LOCAL_DB_VERSION = 1;
       const LOCAL_STORE_NAME = "pendingSpotQueue";
-      const UPLOAD_TIMEOUT_MS = 12000;
+      const UPLOAD_TIMEOUT_MS = 25000;
 
       function openLocalDb() {
         return new Promise((resolve, reject) => {
@@ -540,9 +545,6 @@
           ratingCount: 0,
           avgRating: 0,
 
-          createdOffline: Boolean(spot.createdOffline),
-          localCreatedAt: spot.localCreatedAt || null,
-          syncedAt: firebase.firestore.FieldValue.serverTimestamp(),
           timestamp: firebase.firestore.FieldValue.serverTimestamp(),
         });
       }
@@ -567,6 +569,7 @@
 
         let synced = 0;
         let failed = 0;
+        let lastError = "";
 
         for (const spot of queued) {
           try {
@@ -581,6 +584,7 @@
           } catch (err) {
             console.error(err);
             failed += 1;
+            lastError = getErrorText(err);
           }
         }
 
@@ -589,7 +593,7 @@
         if (failed === 0) {
           status(`Synced ${synced} spot(s) to pending_spots.`, "good");
         } else {
-          status(`Synced ${synced}. ${failed} still locally saved for retry.`, "bad");
+          status(`Synced ${synced}. ${failed} still locally saved. Error: ${lastError}`, "bad");
         }
       }
 
@@ -722,7 +726,7 @@
           resetFormAfterSave();
         } catch (err) {
           console.error(err);
-          status("Internet weak/offline. Spot saved locally and will auto-upload later.", "good");
+          status(`Spot saved locally. Upload retry needed. Error: ${getErrorText(err)}`, "good");
           resetFormAfterSave();
         } finally {
           saveBtn.disabled = false;
