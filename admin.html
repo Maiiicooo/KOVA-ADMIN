@@ -96,6 +96,11 @@
         opacity: 0.5;
       }
 
+      button.secondary {
+        background: rgba(255, 255, 255, 0.1);
+        color: rgba(255, 255, 255, 0.86);
+      }
+
       .grid {
         display: grid;
         grid-template-columns: 1fr 1fr;
@@ -227,6 +232,7 @@
         <button type="submit" id="saveBtn">Save to pending spots</button>
 
         <button type="button" id="syncBtn">Sync locally saved spots</button>
+        <button type="button" id="clearQueueBtn" class="secondary">Clear local saved spots</button>
         <div id="queueStatus" class="small">Locally saved spots: 0</div>
 
         <div id="status" class="status"></div>
@@ -257,6 +263,7 @@
       const gpsBtn = document.getElementById("gpsBtn");
       const saveBtn = document.getElementById("saveBtn");
       const syncBtn = document.getElementById("syncBtn");
+      const clearQueueBtn = document.getElementById("clearQueueBtn");
       const queueStatusEl = document.getElementById("queueStatus");
       const statusEl = document.getElementById("status");
 
@@ -270,6 +277,7 @@
 
       let miniMap = null;
       let spotMarker = null;
+      let syncInProgress = false;
 
       function status(message, type = "") {
         statusEl.textContent = message;
@@ -294,7 +302,7 @@
       const LOCAL_DB_NAME = "kova-offline-spots";
       const LOCAL_DB_VERSION = 1;
       const LOCAL_STORE_NAME = "pendingSpotQueue";
-      const UPLOAD_TIMEOUT_MS = 25000;
+      // No hard upload timeout: a timeout can finish in the background and create duplicate retry problems.
 
       function openLocalDb() {
         return new Promise((resolve, reject) => {
@@ -369,12 +377,18 @@
         await updateQueueStatus();
       }
 
+      async function clearLocalQueue() {
+        await withLocalStore("readwrite", (store) => store.clear());
+        await updateQueueStatus();
+      }
+
       async function updateQueueStatus() {
         try {
           const queued = await getQueuedSpots();
           const count = queued.length;
           queueStatusEl.textContent = `Locally saved spots: ${count}${navigator.onLine ? "" : " · offline"}`;
-          syncBtn.disabled = count === 0;
+          syncBtn.disabled = count === 0 || syncInProgress;
+          clearQueueBtn.disabled = count === 0 || syncInProgress;
         } catch (err) {
           console.error(err);
           queueStatusEl.textContent = "Could not read local queue.";
@@ -526,11 +540,19 @@
         return await snapshot.ref.getDownloadURL();
       }
 
-      async function uploadQueuedSpot(spot) {
-        const docRef = db.collection("pending_spots").doc(spot.id);
-        const photoURL = await uploadPhoto(spot.file, spot.id);
+      async function pendingSpotAlreadyExists(docRef) {
+        try {
+          const snapshot = await docRef.get();
+          return snapshot.exists;
+        } catch (err) {
+          // If rules do not allow reading pending_spots, we simply continue with upload.
+          console.warn("Could not check existing pending spot:", err);
+          return false;
+        }
+      }
 
-        await docRef.set({
+      function makePendingSpotPayload(spot, photoURL) {
+        return {
           name: spot.name,
           description: spot.description,
           photoURL,
@@ -546,10 +568,36 @@
           avgRating: 0,
 
           timestamp: firebase.firestore.FieldValue.serverTimestamp(),
-        });
+        };
+      }
+
+      async function uploadQueuedSpot(spot) {
+        const docRef = db.collection("pending_spots").doc(spot.id);
+
+        // Important: if a previous slow upload eventually succeeded, the local queue may still contain it.
+        // In that case, do not set the document again because Firestore rules may allow create but block update.
+        if (await pendingSpotAlreadyExists(docRef)) {
+          return "already-in-pending";
+        }
+
+        const photoURL = await uploadPhoto(spot.file, spot.id);
+
+        try {
+          await docRef.set(makePendingSpotPayload(spot, photoURL));
+          return "uploaded";
+        } catch (err) {
+          // If the document appeared after the upload started, treat it as synced and remove it locally.
+          if (err && err.code === "permission-denied" && (await pendingSpotAlreadyExists(docRef))) {
+            return "already-in-pending";
+          }
+
+          throw err;
+        }
       }
 
       async function syncQueuedSpots() {
+        if (syncInProgress) return;
+
         if (!navigator.onLine) {
           status("No internet. Spots stay locally saved.", "bad");
           await updateQueueStatus();
@@ -559,28 +607,29 @@
         const queued = await getQueuedSpots();
 
         if (!queued.length) {
-          status("No locally saved spots to sync.", "good");
           await updateQueueStatus();
           return;
         }
 
-        syncBtn.disabled = true;
+        syncInProgress = true;
+        await updateQueueStatus();
         status(`Syncing ${queued.length} locally saved spot(s)...`);
 
-        let synced = 0;
+        let uploaded = 0;
+        let alreadyInPending = 0;
         let failed = 0;
         let lastError = "";
 
         for (const spot of queued) {
           try {
-            await withTimeout(
-              uploadQueuedSpot(spot),
-              UPLOAD_TIMEOUT_MS,
-              "Sync took too long. Will retry later.",
-            );
-
+            const result = await uploadQueuedSpot(spot);
             await deleteLocalSpot(spot.id);
-            synced += 1;
+
+            if (result === "already-in-pending") {
+              alreadyInPending += 1;
+            } else {
+              uploaded += 1;
+            }
           } catch (err) {
             console.error(err);
             failed += 1;
@@ -588,10 +637,13 @@
           }
         }
 
+        syncInProgress = false;
         await updateQueueStatus();
 
+        const synced = uploaded + alreadyInPending;
+
         if (failed === 0) {
-          status(`Synced ${synced} spot(s) to pending_spots.`, "good");
+          status(`Synced ${synced} spot(s). Uploaded: ${uploaded}. Already in pending: ${alreadyInPending}.`, "good");
         } else {
           status(`Synced ${synced}. ${failed} still locally saved. Error: ${lastError}`, "bad");
         }
@@ -707,34 +759,35 @@
 
         // First save locally. This prevents losing the spot if internet dies during upload.
         await saveSpotLocally(localSpot);
+        resetFormAfterSave();
+        saveBtn.disabled = false;
 
-        try {
-          if (!navigator.onLine) {
-            throw new Error("Offline");
-          }
-
-          status("Uploading spot...");
-
-          await withTimeout(
-            uploadQueuedSpot(localSpot),
-            UPLOAD_TIMEOUT_MS,
-            "Upload took too long. Saved locally instead.",
-          );
-
-          await deleteLocalSpot(localSpot.id);
-          status("Spot uploaded to pending_spots. Not live yet.", "good");
-          resetFormAfterSave();
-        } catch (err) {
-          console.error(err);
-          status(`Spot saved locally. Upload retry needed. Error: ${getErrorText(err)}`, "good");
-          resetFormAfterSave();
-        } finally {
-          saveBtn.disabled = false;
-          await updateQueueStatus();
+        if (navigator.onLine) {
+          status("Spot locally saved. Sync started.", "good");
+          syncQueuedSpots();
+        } else {
+          status("Spot locally saved. It will sync when internet is back.", "good");
         }
+
+        await updateQueueStatus();
       });
 
       syncBtn.addEventListener("click", syncQueuedSpots);
+
+      clearQueueBtn.addEventListener("click", async () => {
+        const queued = await getQueuedSpots();
+
+        if (!queued.length) return;
+
+        const confirmed = window.confirm(
+          "Clear local saved spots? Only do this if the spots are already visible in pending_spots.",
+        );
+
+        if (!confirmed) return;
+
+        await clearLocalQueue();
+        status("Local saved spots cleared.", "good");
+      });
 
       window.addEventListener("online", syncQueuedSpots);
       window.addEventListener("offline", updateQueueStatus);
